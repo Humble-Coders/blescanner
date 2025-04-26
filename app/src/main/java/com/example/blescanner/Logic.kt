@@ -8,19 +8,35 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class BLEScannerLogic {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothLeScanner: BluetoothLeScanner? = null
     private var scanCallback: ScanCallback? = null
     private var context: Context? = null
+    private val scannerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Restart scan parameters
+    private val SCAN_PERIOD: Long = 10000 // 10 seconds scan time
+    private var isScanning = false
 
     // Set to store already detected device addresses to prevent duplicate processing
     private val detectedDevices = mutableSetOf<String>()
@@ -42,6 +58,7 @@ class BLEScannerLogic {
         bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun startScanning(onDeviceDetected: (ScanResult) -> Unit) {
         context?.let { ctx ->
             if (ActivityCompat.checkSelfPermission(
@@ -52,43 +69,16 @@ class BLEScannerLogic {
                 return
             }
 
-            // Initialize scanCallback
-            scanCallback = object : ScanCallback() {
-                @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    super.onScanResult(callbackType, result)
+            if (isScanning) {
+                // Already scanning, don't start again
+                return
+            }
 
-                    // Log all detected devices for debugging
-                    Log.d("BLE", "Device detected: ${result.device.address}, Name: ${result.device.name}")
+            isScanning = true
 
-                    // Process the result to check if it's our target ESP device
-                    val deviceName = result.device.name
-
-                    // If device name matches our target or contains "ESP", process it
-                    if (deviceName != null &&
-                        (deviceName.contains(targetEspName, ignoreCase = true) ||
-                                deviceName.contains("ESP", ignoreCase = true))) {
-
-                        // Check if we've already processed this device
-                        val deviceKey = "${result.device.address}_${result.scanRecord?.bytes?.contentHashCode() ?: 0}"
-                        if (!detectedDevices.contains(deviceKey)) {
-                            // Add to our set of detected devices
-                            detectedDevices.add(deviceKey)
-
-                            Log.d("BLE", "NEW ESP Device detected: ${result.device.address}, Name: $deviceName")
-
-                            // Call the onDeviceDetected callback to process this result
-                            onDeviceDetected(result)
-                        } else {
-                            Log.d("BLE", "Already processed device: ${result.device.address}")
-                        }
-                    }
-                }
-
-                override fun onScanFailed(errorCode: Int) {
-                    super.onScanFailed(errorCode)
-                    Log.e("BLE", "Scan failed with error code: $errorCode")
-                }
+            // Initialize scanCallback if null
+            if (scanCallback == null) {
+                scanCallback = createScanCallback(onDeviceDetected)
             }
 
             // Configure scan settings for low latency but without any UUID filters
@@ -97,13 +87,26 @@ class BLEScannerLogic {
                 .build()
 
             // Start scanning WITHOUT any filters to capture all devices
-            // We'll filter by name in the callback
             bluetoothLeScanner?.startScan(null, scanSettings, scanCallback)
-
             Log.d("BLE", "Started BLE scan with name filtering")
+
+            // Schedule scan restart after SCAN_PERIOD
+            mainHandler.postDelayed({
+                restartScan(onDeviceDetected)
+            }, SCAN_PERIOD)
         }
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
+    private fun restartScan(onDeviceDetected: (ScanResult) -> Unit) {
+        stopScanning()
+        // Short delay before restarting
+        mainHandler.postDelayed({
+            startScanning(onDeviceDetected)
+        }, 100)
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun stopScanning() {
         context?.let { ctx ->
             if (ActivityCompat.checkSelfPermission(
@@ -114,10 +117,63 @@ class BLEScannerLogic {
                 return
             }
 
-            // Stop scanning
-            scanCallback?.let { callback ->
-                bluetoothLeScanner?.stopScan(callback)
-                Log.d("BLE", "Stopped BLE scan")
+            // Remove any pending scan restart
+            mainHandler.removeCallbacksAndMessages(null)
+
+            // Stop scanning only if we are currently scanning
+            if (isScanning) {
+                scanCallback?.let { callback ->
+                    bluetoothLeScanner?.stopScan(callback)
+                    Log.d("BLE", "Stopped BLE scan")
+                }
+                isScanning = false
+            }
+        }
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    private fun createScanCallback(onDeviceDetected: (ScanResult) -> Unit): ScanCallback {
+        return object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                super.onScanResult(callbackType, result)
+
+                // Process in the background to avoid UI thread blocking
+
+                scannerScope.launch  {
+                    // Process the result to check if it's our target ESP device
+                    val deviceName = result.device.name
+
+                    // If device name matches our target or contains "ESP", process it
+                    if (deviceName != null &&
+                        (deviceName.contains(targetEspName, ignoreCase = true) ||
+                                deviceName.contains("ESP", ignoreCase = true))
+                    ) {
+                        // Check if we've already processed this device
+                        val deviceKey = "${result.device.address}_${result.scanRecord?.bytes?.contentHashCode() ?: 0}"
+                        if (!detectedDevices.contains(deviceKey)) {
+                            // Add to our set of detected devices
+                            detectedDevices.add(deviceKey)
+
+                            Log.d("BLE", "NEW ESP Device detected: ${result.device.address}, Name: $deviceName")
+
+                            // Call the onDeviceDetected callback on main thread
+                            withContext(Dispatchers.Main) {
+                                onDeviceDetected(result)
+                            }
+                        }
+                    }
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                super.onScanFailed(errorCode)
+                Log.e("BLE", "Scan failed with error code: $errorCode")
+
+                // Try to restart scan after a short delay
+                mainHandler.postDelayed({
+                    isScanning = false
+                    startScanning(onDeviceDetected)
+                }, 1000)
             }
         }
     }
@@ -132,13 +188,11 @@ class BLEScannerLogic {
         // Check if this is our ESP device based on device name
         if (result.device.name?.contains(targetEspName, ignoreCase = true) == true) {
             isEspDevice = true
-            Log.d("BLE_DATA", "Found our ESP device: ${result.device.name}, Address: ${result.device.address}")
         }
 
         // If device name is null but we're still interested in checking any ESP device
         if (!isEspDevice && result.device.name?.contains("ESP", ignoreCase = true) == true) {
             isEspDevice = true
-            Log.d("BLE_DATA", "Found generic ESP device: ${result.device.name}, Address: ${result.device.address}")
         }
 
         // For ESP devices, try to extract the message
@@ -149,17 +203,14 @@ class BLEScannerLogic {
                 for (i in 0 until manufacturerData.size()) {
                     val manData = manufacturerData.valueAt(i)
                     if (manData != null) {
-                        // Check if manufacturer ID is 0xFFFF as used in the ESP code
-                        val manufacturerId = manufacturerData.keyAt(i)
-                        Log.d("BLE_DATA", "Manufacturer ID: 0x${Integer.toHexString(manufacturerId)}, Data length: ${manData.size}")
-
                         // Try to interpret as text (skip first 2 bytes if they're the manufacturer ID in ESP code)
                         var startIndex = 0
 
                         // If the first two bytes match the manufacturer ID format from ESP code
                         if (manData.size >= 2 &&
                             (manData[0].toInt() and 0xFF) == 0xFF &&
-                            (manData[1].toInt() and 0xFF) == 0xFF) {
+                            (manData[1].toInt() and 0xFF) == 0xFF
+                        ) {
                             startIndex = 2
                         }
 
@@ -174,7 +225,6 @@ class BLEScannerLogic {
 
                         if (potentialMessage.isNotEmpty()) {
                             message = potentialMessage.toString()
-                            Log.d("BLE_DATA", "Extracted message from manufacturer data: $message")
                             break
                         }
                     }
@@ -184,7 +234,6 @@ class BLEScannerLogic {
             // Method 2: Parse raw advertisement bytes (fallback)
             if (message.isBlank() && scanRecord.bytes != null) {
                 val rawData = scanRecord.bytes
-                Log.d("BLE_DATA", "Checking raw advertisement data, length: ${rawData.size}")
 
                 try {
                     // In BLE advertisements, manufacturer data typically has type 0xFF
@@ -200,7 +249,8 @@ class BLEScannerLogic {
                             // Manufacturer ID should be the next 2 bytes (0xFFFF for our ESP)
                             if (length >= 4 && // At least 2 bytes for mfg ID + some data
                                 rawData[index + 2].toInt() == 0xFF &&
-                                rawData[index + 3].toInt() == 0xFF) {
+                                rawData[index + 3].toInt() == 0xFF
+                            ) {
 
                                 // Extract the data portion (skip the 2-byte manufacturer ID)
                                 val dataBytes = ByteArray(length - 3) // -1 for type byte, -2 for mfg ID
@@ -217,7 +267,6 @@ class BLEScannerLogic {
 
                                 if (extractedText.isNotEmpty()) {
                                     message = extractedText.toString()
-                                    Log.d("BLE_DATA", "Extracted from raw data: $message")
                                     break
                                 }
                             }
@@ -235,38 +284,77 @@ class BLEScannerLogic {
         return ScanResultWithText(result, message.isNotBlank(), message, isEspDevice)
     }
 
+    suspend fun markAttendanceAsync(subjectName: String, studentName: String, rollNumber: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val db = Firebase.firestore
+
+                // Get today's date in the format "dd-MM-yyyy"
+                val dateFormat = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
+                val todayDate = dateFormat.format(Date())
+
+                // Create or update the Firestore document
+                db.collection("Subjects")
+                    .document(subjectName)
+                    .collection(todayDate)
+                    .document(rollNumber)
+                    .set(mapOf("name" to studentName))
+                    .await()
+
+                Log.d("Firestore", "Attendance marked for $studentName in $subjectName")
+                true
+            } catch (e: Exception) {
+                Log.e("Firestore", "Error marking attendance", e)
+                false
+            }
+        }
+    }
+
+    // Original markAttendance method kept for backward compatibility
     fun markAttendance(subjectName: String, studentName: String, rollNumber: String, onSuccess: () -> Unit = {}) {
         val db = Firebase.firestore
 
-        // Get today's date in the format "dd-MM-yyyy"
-        val dateFormat = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
-        val todayDate = dateFormat.format(Date())
+        scannerScope.launch {
+            try {
+                // Get today's date in the format "dd-MM-yyyy"
+                val dateFormat = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
+                val todayDate = dateFormat.format(Date())
 
-        // Create or update the Firestore document
-        db.collection("Subjects")
-            .document(subjectName)
-            .collection(todayDate)
-            .document(rollNumber)
-            .set(mapOf("name" to studentName))
-            .addOnSuccessListener {
+                // Create or update the Firestore document
+                db.collection("Subjects")
+                    .document(subjectName)
+                    .collection(todayDate)
+                    .document(rollNumber)
+                    .set(mapOf("name" to studentName))
+                    .await()
+
                 Log.d("Firestore", "Attendance marked for $studentName in $subjectName")
-                // Stop scanning after attendance is marked
-                stopScanning()
-                // Clear detected devices to allow rescanning later if needed
-                detectedDevices.clear()
-                // Call success callback
-                onSuccess()
-            }
-            .addOnFailureListener { e ->
+
+                // Call success callback on the main thread
+                withContext(Dispatchers.Main) {
+                    onSuccess()
+                }
+            } catch (e: Exception) {
                 Log.e("Firestore", "Error marking attendance", e)
-                context?.let {
-                    android.widget.Toast.makeText(it, "Failed to mark attendance", android.widget.Toast.LENGTH_SHORT).show()
+                withContext(Dispatchers.Main) {
+                    context?.let {
+                        android.widget.Toast.makeText(it, "Failed to mark attendance", android.widget.Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
+        }
     }
 
     // Method to clear detected devices (useful when restarting scan)
     fun clearDetectedDevices() {
         detectedDevices.clear()
+    }
+
+    // Clean up resources
+    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
+    fun cleanup() {
+        stopScanning()
+        mainHandler.removeCallbacksAndMessages(null)
+        scannerScope.cancel()
     }
 }
