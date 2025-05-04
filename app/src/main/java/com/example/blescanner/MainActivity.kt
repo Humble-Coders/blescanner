@@ -39,17 +39,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import android.Manifest
-import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
-import androidx.annotation.RequiresPermission
 import androidx.compose.ui.text.font.FontStyle
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.*
 
@@ -71,7 +65,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     override fun onDestroy() {
         super.onDestroy()
         bleLogic.cleanup()
@@ -103,7 +96,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun BLEScannerApp(bleLogic: BLEScannerLogic) {
     val context = LocalContext.current
-    var hasPermissions by remember { mutableStateOf(false) }
     var studentName by remember { mutableStateOf("Alex Johnson") }
     var rollNumber by remember { mutableStateOf("20230045") }
     var showConfirmationDialog by remember { mutableStateOf(false) }
@@ -127,76 +119,31 @@ fun BLEScannerApp(bleLogic: BLEScannerLogic) {
         label = "pulseAnimation"
     )
 
-    // Permission launcher
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.values.all { it }
-        if (allGranted) {
-            hasPermissions = true
-        } else {
-            Toast.makeText(context, "Permissions are required for BLE scanning", Toast.LENGTH_LONG).show()
-            hasPermissions = false
-        }
-    }
-
-    // Check and request permissions
+    // Start continuous scanning - no need to check permissions as BLE Made Easy handles this
     LaunchedEffect(Unit) {
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            listOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            )
-        } else {
-            listOf(
-                Manifest.permission.BLUETOOTH,
-                Manifest.permission.BLUETOOTH_ADMIN,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            )
-        }
+        bleLogic.clearDetectedDevices()
+        scanResults = emptyList()
 
-        val missingPermissions = permissions.filter {
-            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missingPermissions.isNotEmpty()) {
-            permissionLauncher.launch(missingPermissions.toTypedArray())
-        } else {
-            hasPermissions = true
-        }
-    }
-
-    // Start continuous scanning
-    LaunchedEffect(hasPermissions) {
-        if (hasPermissions) {
-            bleLogic.clearDetectedDevices()
-            scanResults = emptyList()
-
-            Log.d("BLE", "Starting continuous BLE scanning")
-            bleLogic.startScanning { result ->
-                val processedResult = bleLogic.processScanResult(result)
-
-                if (processedResult.isEspDevice) {
-                    // Update scan results with new device or update existing one
-                    scanResults = scanResults.toMutableList().apply {
-                        val existingIndex = indexOfFirst { it.result.device.address == result.device.address }
-                        if (existingIndex >= 0) {
-                            this[existingIndex] = processedResult
-                        } else {
-                            add(processedResult)
-                        }
-                    }
-
-                    if (processedResult.hasTextData &&
-                        processedResult.message.isNotBlank() &&
-                        !isAttendanceMarked &&
-                        !isMarkingAttendance &&
-                        !showConfirmationDialog) {
-                        detectedSubject = processedResult.message
-                        showConfirmationDialog = true
-                    }
+        Log.d("BLE", "Starting continuous BLE scanning")
+        bleLogic.startScanning { processedResult ->
+            // Update scan results with new device or update existing one
+            scanResults = scanResults.toMutableList().apply {
+                val existingIndex = indexOfFirst { it.deviceAddress == processedResult.deviceAddress }
+                if (existingIndex >= 0) {
+                    this[existingIndex] = processedResult
+                } else {
+                    add(processedResult)
                 }
+            }
+
+            if (processedResult.hasTextData &&
+                processedResult.message.isNotBlank() &&
+                !isAttendanceMarked &&
+                !isMarkingAttendance &&
+                !showConfirmationDialog
+            ) {
+                detectedSubject = processedResult.message
+                showConfirmationDialog = true
             }
         }
     }
@@ -354,6 +301,130 @@ fun BLEScannerApp(bleLogic: BLEScannerLogic) {
         }
     }
 }
+
+// The rest of your composable functions remain the same as in the original code
+// Only DeviceCard needs to be updated since we changed ScanResultWithText
+
+@Composable
+fun DeviceCard(
+    result: BLEScannerLogic.ScanResultWithText,
+    isAttendanceMarked: Boolean
+) {
+    val deviceName = result.deviceName ?: "ESP Device"
+    val deviceAddress = result.deviceAddress
+    val hasMessage = result.hasTextData
+    val message = result.message
+
+    // Use key for better animation handling
+    key(deviceAddress) {
+        AnimatedVisibility(
+            visible = true,
+            enter = fadeIn(tween(400)) + expandVertically(tween(400, easing = EaseOutQuint)),
+            exit = fadeOut() + shrinkVertically()
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp, horizontal = 8.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color.White.copy(alpha = 0.95f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = deviceName,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFF1A2151)
+                        )
+
+                        // Signal strength indicator - no RSSI with BLE Made Easy
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.NetworkCell,
+                                contentDescription = "Signal",
+                                tint = Color(0xFF2E7D32),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "Connected",
+                                fontSize = 13.sp,
+                                color = Color.DarkGray
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = deviceAddress,
+                        fontSize = 13.sp,
+                        color = Color.DarkGray.copy(alpha = 0.7f)
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (hasMessage) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0xFFE8F5E9))
+                                .padding(8.dp)
+                                .border(
+                                    width = 1.dp,
+                                    color = Color(0xFF2E7D32),
+                                    shape = RoundedCornerShape(4.dp)
+                                )
+                        ) {
+                            Text(
+                                text = "Class Identifier:",
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = Color(0xFF2E7D32)
+                            )
+                            Text(
+                                text = message,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFF2E7D32)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        if (isAttendanceMarked) {
+                            Text(
+                                text = "Attendance recorded for this session",
+                                fontSize = 13.sp,
+                                color = Color(0xFF2E7D32),
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = "No class identifier detected",
+                            fontSize = 13.sp,
+                            color = Color.Gray,
+                            fontStyle = FontStyle.Italic
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Retain other composable functions from the original code (StatusCard, StudentInfoCard, etc.)
 
 @Composable
 fun StatusCard(isAttendanceMarked: Boolean, isMarkingAttendance: Boolean, pulse: Float) {
@@ -573,130 +644,6 @@ fun DeviceList(
     }
 }
 
-@RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
-@Composable
-fun DeviceCard(
-    result: BLEScannerLogic.ScanResultWithText,
-    isAttendanceMarked: Boolean
-) {
-    val scanResult = result.result
-    val hasMessage = result.hasTextData
-    val deviceName = scanResult.device.name ?: "ESP Device"
-    val deviceAddress = scanResult.device.address
-    val rssi = scanResult.rssi
-    val message = result.message
-
-    // Use key for better animation handling
-    key(deviceAddress) {
-        AnimatedVisibility(
-            visible = true,
-            enter = fadeIn(tween(400)) + expandVertically(tween(400, easing = EaseOutQuint)),
-            exit = fadeOut() + shrinkVertically()
-        ) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp, horizontal = 8.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = Color.White.copy(alpha = 0.95f)
-                )
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = deviceName,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = Color(0xFF1A2151)
-                        )
-
-                        // Signal strength indicator
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.NetworkCell,
-                                contentDescription = "Signal",
-                                tint = when {
-                                    rssi > -50 -> Color(0xFF2E7D32)
-                                    rssi > -70 -> Color(0xFFFFA000)
-                                    else -> Color(0xFFC62828)
-                                },
-                                modifier = Modifier.size(18.dp))
-                            Text(
-                                text = "$rssi dBm",
-                                fontSize = 13.sp,
-                                color = Color.DarkGray
-                            )
-                        }
-                    }
-
-                    Text(
-                        text = deviceAddress,
-                        fontSize = 13.sp,
-                        color = Color.DarkGray.copy(alpha = 0.7f)
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    if (hasMessage) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFFE8F5E9))
-                                .padding(8.dp)
-                                .border(
-                                    width = 1.dp,
-                                    color = Color(0xFF2E7D32),
-                                    shape = RoundedCornerShape(4.dp)
-                                )
-                        ) {
-                            Text(
-                                text = "Class Identifier:",
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 13.sp,
-                                color = Color(0xFF2E7D32)
-                            )
-                            Text(
-                                text = message,
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = Color(0xFF2E7D32)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        if (isAttendanceMarked) {
-                            Text(
-                                text = "Attendance recorded for this session",
-                                fontSize = 13.sp,
-                                color = Color(0xFF2E7D32),
-                                fontWeight = FontWeight.Medium,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
-                        }
-                    } else {
-                        Text(
-                            text = "No class identifier detected",
-                            fontSize = 13.sp,
-                            color = Color.Gray,
-                            fontStyle = FontStyle.Italic
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
 
 @Composable
 fun EmptyDeviceList() {

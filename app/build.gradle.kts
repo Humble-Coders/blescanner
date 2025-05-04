@@ -28,6 +28,12 @@ android {
             )
         }
     }
+
+    packaging {
+        resources {
+            excludes += listOf("META-INF/NOTICE.md", "META-INF/LICENSE.md")
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
@@ -50,6 +56,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.appcompat)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -61,4 +68,6 @@ dependencies {
     implementation("com.google.firebase:firebase-analytics")
     implementation ("com.google.firebase:firebase-firestore-ktx")
     implementation(libs.androidx.material.icons.extended)
+    implementation ("com.github.LeandroSQ:android-ble-made-easy:1.9.3")
+
 }
